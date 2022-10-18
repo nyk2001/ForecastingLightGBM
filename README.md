@@ -1,2 +1,2 @@
 # ForecastingLightGBM
-Forecasting sales data
+Forecasting sales data using LightGBM library
