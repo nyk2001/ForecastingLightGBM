@@ -50,9 +50,11 @@ import pyspark.pandas as ps
 
 # Read pandas dataframe
 data_df = pd.read_csv(os.path.join(os.getcwd(),'train.csv'))
-
+data_df['date'] = pd.to_datetime(data_df['date'])
+print(type(data_df))
 # Convert pandas to pandas API
 pd_spark_df = ps.DataFrame(data_df)
+print(type(pd_spark_df))
 pd_spark_df.head()
 
 # COMMAND ----------
@@ -67,6 +69,7 @@ pd_spark_df.head()
 
 # COMMAND ----------
 
+# Fine for non-time series data
 def split_data(train_data):
     
     # Break down the date object into month, day, and year
@@ -97,6 +100,55 @@ def split_data(train_data):
 
 # Split data
 train_x, test_x, val_x, train_y, test_y, val_y= split_data(data_df)
+
+# COMMAND ----------
+
+ def test_train_split_timeseries_data(data_df, split_ratio):
+    # Break down the date object into month, day, and year
+    pd_spark_df['month'] = pd_spark_df['date'].dt.month
+    pd_spark_df['day'] = pd_spark_df['date'].dt.dayofweek
+    pd_spark_df['year'] = pd_spark_df['date'].dt.year
+
+    train_split = split_ratio
+    
+    # Find the unique store ids
+    unique_elements = pd_spark_df['store'].unique().to_numpy()
+    unique_elements= np.sort(unique_elements,axis=0)
+    
+    # Creating new train and test data sets
+    df_train = ps.DataFrame()
+    df_test = ps.DataFrame()
+    
+    for each_element in unique_elements:
+        temp_df = {}
+        
+        # Extract sales data for each store
+        temp_spark_df = data_df[data_df['store']==int(each_element)].copy()
+        
+        # Sort data with respect to the date column
+        temp_spark_df = temp_spark_df.sort_values(by=['date'], ascending=True)
+        temp_spark_df.reset_index(drop=True, inplace=True)
+
+        total_elements = temp_spark_df.shape[0]
+        train_elements = int(temp_spark_df.shape[0]*train_split)
+        
+        # First 90% for training
+        df_train= df_train.append(temp_spark_df[0:train_elements])
+        
+        # Remaining 10% for testing
+        df_test=  df_test.append(temp_spark_df[train_elements:])
+
+    df_train.reset_index(drop=True, inplace=True)
+    df_test.reset_index(drop=True, inplace=True)
+
+    # Train columns
+    col = [i for i in df_train.columns if i not in ['date','sales']]
+    y = 'sales'
+
+    return df_train[col],df_train[y], df_test[col], df_test[y],df_train, df_test
+
+temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(pd_spark_df,0.9)
+train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8)
 
 # COMMAND ----------
 
@@ -191,12 +243,13 @@ def get_model_parameters(search_params):
 
 # Train model
 def train_model(train_x,train_y,test_x,test_y,iterations, search_params):
+    
     # Get parameters from models
     parameters = get_model_parameters(search_params)
     
-    # Create datasets
-    lgb_train = lgb.Dataset(train_x,train_y)
-    lgb_valid = lgb.Dataset(test_x,test_y)
+    # Create datasets (converting pyspark to numpy)
+    lgb_train = lgb.Dataset(train_x.to_numpy(), train_y.to_numpy())
+    lgb_valid = lgb.Dataset(test_x.to_numpy(), test_y.to_numpy())
     
     # Model crated
     model = lgb.train(parameters, 
@@ -226,7 +279,6 @@ run_id =-1
 try:
     experiment_id = mlflow.create_experiment("/Users/nabekhan@deloitte.com.au/forecasting-lightgbm")
 except Exception as e:
-    print(str(e))
     experiment_details = mlflow.get_experiment_by_name("/Users/nabekhan@deloitte.com.au/forecasting-lightgbm")
     experiment_id = experiment_details.experiment_id
 
@@ -242,8 +294,6 @@ with mlflow.start_run(run_name= "LightGBM", experiment_id=experiment_id) as run:
     
     run = mlflow.active_run()
     run_id = run.info.run_id
-    
-   
 
 # COMMAND ----------
 
@@ -256,7 +306,7 @@ model_path = f"runs:/{run_id}/model"
 loaded_model = mlflow.pyfunc.load_model(model_path)
 
 # Predict on a Pandas DataFrame.
-predictions = loaded_model.predict(test_x)
+predictions = loaded_model.predict(test_x.to_numpy())
 rmse = mean_squared_error(test_y.values, predictions)
 mape = mean_absolute_percentage_error(test_y.values, predictions)
 print("The best MAPE score for validation dataset = %0.3f"%score)
@@ -320,8 +370,8 @@ from hyperopt import hp, fmin,tpe, Trials
 import mlflow
 
 # Create datasets
-lgb_train = lgb.Dataset(train_x,train_y)
-lgb_valid = lgb.Dataset(test_x,test_y)
+lgb_train = lgb.Dataset(train_x.to_numpy(),train_y.to_numpy())
+lgb_valid = lgb.Dataset(test_x.to_numpy(),test_y.to_numpy())
 
 search_space = {
         'lr': hp.uniform('lr', 0.1, 0.5),
@@ -373,7 +423,7 @@ with mlflow.start_run(experiment_id = experiment_id,
     forecast_model , score = train_model(train_x,train_y,val_x,val_y,3000, seearch_space)
     
     # Log model
-    mlflow.lightgbm.log_model(forecast_model, "lightgbm-model", input_example=train_x.head(10))
+    mlflow.lightgbm.log_model(forecast_model, "lightgbm-model", input_example=train_x.head(5).to_numpy())
     
     mlflow.log_param("mape", score)
     print('The best MAPE for validation = %0.3f'%score)
@@ -391,7 +441,7 @@ with mlflow.start_run(experiment_id = experiment_id,
     # Get run ids
     run = mlflow.active_run()
     run_id = run.info.run_id
-    print(run_id)
+    
 
 # COMMAND ----------
 
@@ -404,7 +454,7 @@ model_path = f"runs:/{run_id}/lightgbm-model"
 loaded_model = mlflow.pyfunc.load_model(model_path)
 
 # Predict on a Pandas DataFrame.
-predictions = loaded_model.predict(test_x)
+predictions = loaded_model.predict(test_x.to_numpy())
 rmse = mean_squared_error(test_y.values, predictions)
 mape = mean_absolute_percentage_error(test_y.values, predictions)
 print("The best MAPE score for validation dataset = %0.3f"%score)
