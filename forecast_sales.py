@@ -104,7 +104,9 @@ train_x, test_x, val_x, train_y, test_y, val_y= split_data(data_df)
 
 # COMMAND ----------
 
- def test_train_split_timeseries_data(data_df, split_ratio):
+import random
+
+def test_train_split_timeseries_data(data_df, split_ratio, random_ratio= False):
     # Break down the date object into month, day, and year
     pd_spark_df['month'] = pd_spark_df['date'].dt.month
     pd_spark_df['day'] = pd_spark_df['date'].dt.dayofweek
@@ -129,7 +131,10 @@ train_x, test_x, val_x, train_y, test_y, val_y= split_data(data_df)
         # Sort data with respect to the date column
         temp_spark_df = temp_spark_df.sort_values(by=['date'], ascending=True)
         temp_spark_df.reset_index(drop=True, inplace=True)
-
+        
+        if random_ratio:
+            train_split = random.uniform(0.75, 0.85)
+        
         total_elements = temp_spark_df.shape[0]
         train_elements = int(temp_spark_df.shape[0]*train_split)
         
@@ -149,7 +154,7 @@ train_x, test_x, val_x, train_y, test_y, val_y= split_data(data_df)
     return df_train[col],df_train[y], df_test[col], df_test[y],df_train, df_test
 
 temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(pd_spark_df,0.9)
-train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8)
+train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8, True)
 
 # COMMAND ----------
 
@@ -291,7 +296,8 @@ project_description = ("Train LightGBM model without any parameter tuning. The t
 with mlflow.start_run(run_name= "LightGBM", 
                       tags={"Problem": "Timeseries forecasting", 
                              "mlflow.note.content": project_description}, 
-                      experiment_id=experiment_id) as run:
+                      experiment_id=experiment_id,
+                      nested=True) as run:
     mlflow.lightgbm.autolog(log_input_examples=True, log_model_signatures=True, log_models=True)
     model , score = train_model(train_x,train_y,val_x,val_y,3000, {})
     
