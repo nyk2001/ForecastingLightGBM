@@ -34,28 +34,182 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-
 import warnings
 warnings.filterwarnings("ignore")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Load data
+# MAGIC ### Load data in pandas
 
 # COMMAND ----------
 
 import os
-import pyspark.pandas as ps
 
-# Read pandas dataframe
+# Read csv data into pandas dataframe
 data_path = os.path.join(os.getcwd(),'train.csv')
 data_df = pd.read_csv(data_path)
-data_df['date'] = pd.to_datetime(data_df['date'])
-print(type(data_df))
+print("Total elements = %d"%data_df.shape[0])
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Feature Engineering
+
+# COMMAND ----------
+
+# Generating extra features such as week of year, day of week etc
+from pyspark.pandas.config import set_option, reset_option
+set_option("compute.ops_on_diff_frames", True)
+
+def create_date_features(df):
+    data_df['date'] = pd.to_datetime(data_df['date'])
+    df['month'] = df['date'].dt.month
+    df['day'] = df['date'].dt.dayofweek
+    df['year'] = df['date'].dt.year    
+    df['week_of_year'] = df['date'].dt.weekofyear # Which week of the corresponding year
+    df['day_of_week'] = df['date'].dt.dayofweek # Which day of the corresponding week of the each month
+    df["is_wknd"] = df.date.dt.weekday // 4
+    df['is_month_start'] = df['date'].dt.is_month_start.astype(int) # Is it starting of the corresponding month
+    df['is_month_end'] = df['date'].dt.is_month_end.astype(int) # Is it ending of the corresponding month
+    
+    return df
+
+
+data_df = create_date_features(data_df)
+data_df.head()
+
+
+# COMMAND ----------
+
+print("Total elements = %d"%data_df.shape[0])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Lagged features
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC *Adding "Random Noise" to the "Lag/Shifted Features"*
+# MAGIC * We are generating these "Lag/Shifted Features" from the target variable "sales", actually we are causing a problem which is called **data leakage** in data science literature. 
+# MAGIC * The reason of that **data leakage** problem is that in our case, normally we shouldn't generate features by using target variable when we are working on ML project. Because it causes **overfitting** to the train data. Model notices target variable base features explains "target" column well, and focuses more to that columns. Consequently, it loses its "generalization" ability.
+# MAGIC * This will cause, model will not to learn the exact values of target variable and as a result we avoid "overfitting" situation
+
+# COMMAND ----------
+
+# Let's first create "Random Noise" function, for using when we want 
+def random_noise(dataframe):
+    return np.random.normal(scale=1.6, size=(len(dataframe),)) # Gaussian random noise
+
+
+# And let's create "Lag/Shifted Features" by using this function
+# Since we will create more than 1 "Lag/Shifted Features" I created that function.
+def create_lagged_features(df, lags):
+    for lag in lags:
+        df['sales_lag_' + str(lag)] = df.groupby(["store", "item"])['sales'].transform(lambda x: x.shift(lag))+ random_noise(df)
+    return df
+
+
+#def create_lagged_features(df):    
+#    # Let's see an example : With this code we generate 'lag1' feature for ecah unique 'item' in each 'store' separately.
+#    df['lag_1']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(1))
+#    df['lag_2']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(2))
+#    df['lag_3']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(3))
+#    
+#    return df
+print("Total elements = %d"%data_df.shape[0])
+lagged_data_df = create_lagged_features(data_df,[1,3,5,7])
+print("Total elements = %d"%lagged_data_df.shape[0])
+lagged_data_df.head(10)   
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Rolling Window
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC * "Moving Average Method" is used for forcasting "Time Series" problems. This method simply takes "n" previous target variable and averages them and returns as a new value.
+# MAGIC * So since we know that, this kind of method is used for forcasting "Time Series" problems, again we generate new feature by using that method.
+# MAGIC * So since we said that while using ML approach we have to generate features that represent time series patterns, we actually get help from traditional methods for that purpose.
+
+# COMMAND ----------
+
+# Let's create "rolling mean features".
+def roll_mean_features(df, windows):
+    for window in windows:
+        df['sales_roll_mean_' + str(window)] = df.groupby(["store", "item"])['sales'].\
+        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).mean()) + random_noise(df)
+    return df
+
+# Let's create "rolling sum features".
+def roll_sum_features(df, windows):
+    for window in windows:
+        df['sales_roll_sum_' + str(window)] = df.groupby(["store", "item"])['sales'].\
+        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).sum()) + random_noise(df)
+    return df
+
+# Using two window sizes
+windows_size = [3,7] 
+rolled_data_df = roll_mean_features(lagged_data_df, windows_size)
+rolled_data_df = roll_sum_features(rolled_data_df, windows_size)
+print("Total elements = %d"%rolled_data_df.shape[0])
+rolled_data_df.head(10)  
+
+
+# COMMAND ----------
+
+print("Total elements = %d"%rolled_data_df.shape[0])
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #### Exponentially Weighted Mean Features
+# MAGIC 
+# MAGIC * Another traditional "Time Series Method" is "Exponentially Weighted Mean" method. This method has parameter called _alpha_ used as smoothing factor. This parameter ranges between [0, 1]. If _alpha_ is close to 1 while taking average for last for instance 10 days(rolling mean features also was taking averages but without giving weight), it gives more _weight_ to the close days and decreases the _weight_ when going to more past days.  
+# MAGIC * You can read about this method more on internet, but briefly normally in time series forecatsing it's better to give more _weights_ to the more recent days rather tham giving same _weight_ to all past days.
+# MAGIC * Because more recent days have more influence to the current day. Therefore, giving more _weight_ to the more recent days makes sense.
+# MAGIC * This method uses that formula behind in its calculations(xt : past days values) : 
+# MAGIC 
+# MAGIC * As we see when it goes more past values it decreases the _weight_
+
+# COMMAND ----------
+
+# Let's create 'Exponentially Weighted Mean Features' 
+def ewm_features(df, alphas, lags):
+    for alpha in alphas:
+        for lag in lags:
+            df['sales_ewm_alpha_' + str(alpha).replace(".", "") + "_lag_" + str(lag)] = \
+                df.groupby(["store", "item"])['sales'].transform(lambda x: x.shift(lag).ewm(alpha=alpha).mean())
+    
+    return df
+
+# In here we have two combinations : alphas and lags. Agian we give variety of variables for both and will se which one is best. 
+alphas = [1.0, 0.95]
+lags = [3,7]
+
+final_data_df = ewm_features(rolled_data_df, alphas, lags)
+final_data_df.head(10)
+
+# COMMAND ----------
+
+print("Total elements = %d"%final_data_df.shape[0])
+
+
+# COMMAND ----------
+
+import pyspark.pandas as ps
+
+print("Total elements = %d"%final_data_df.shape[0])
+final_data_df.dropna(inplace=True)
+print("Total elements after removing nulls = %d"%final_data_df.shape[0])
+
 # Convert pandas to pandas API
-pd_spark_df = ps.DataFrame(data_df)
-print(type(pd_spark_df))
+pd_spark_df = ps.DataFrame(final_data_df)
 pd_spark_df.head()
 
 # COMMAND ----------
@@ -70,48 +224,10 @@ pd_spark_df.head()
 
 # COMMAND ----------
 
-# Fine for non-time series data
-def split_data(train_data):
-    
-    # Break down the date object into month, day, and year
-    train_data['date'] = pd.to_datetime(train_data['date'])
-    train_data['month'] = train_data['date'].dt.month
-    train_data['day'] = train_data['date'].dt.dayofweek
-    train_data['year'] = train_data['date'].dt.year
-
-    # Include all columns 
-    col = [i for i in train_data.columns if i not in ['date','sales']]
-    y = 'sales'
-    
-    # First split to get train and test set
-    training_x, test_x, training_y, test_y = train_test_split(train_data[col],train_data[y],stratify = train_data['store'], test_size=0.2, random_state=2018)
-    
-    # Split train into train and test set
-    train_x, val_x, train_y, val_y = train_test_split(training_x[col],training_y, test_size=0.2, random_state=2018,stratify = training_x['store']) 
-    
-    train_x.reset_index(drop=True, inplace=True)
-    test_x.reset_index(drop=True, inplace=True)
-    val_x.reset_index(drop=True, inplace=True)
-    
-    train_y.reset_index(drop=True, inplace=True)
-    test_y.reset_index(drop=True, inplace=True)
-    val_y.reset_index(drop=True, inplace=True)
-    
-    return train_x, test_x, val_x, train_y, test_y, val_y
-
-# Split data
-train_x, test_x, val_x, train_y, test_y, val_y= split_data(data_df)
-
-# COMMAND ----------
-
 import random
 
 def test_train_split_timeseries_data(data_df, split_ratio, random_ratio= False):
-    # Break down the date object into month, day, and year
-    pd_spark_df['month'] = pd_spark_df['date'].dt.month
-    pd_spark_df['day'] = pd_spark_df['date'].dt.dayofweek
-    pd_spark_df['year'] = pd_spark_df['date'].dt.year
-
+    
     train_split = split_ratio
     
     # Find the unique store ids
@@ -153,8 +269,14 @@ def test_train_split_timeseries_data(data_df, split_ratio, random_ratio= False):
 
     return df_train[col],df_train[y], df_test[col], df_test[y],df_train, df_test
 
-temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(pd_spark_df,0.9)
-train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8, True)
+# Use 80% for training and 20% for testing
+temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(pd_spark_df,0.8)
+# Use 80%for training and 20% for validation
+train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8)
+
+# COMMAND ----------
+
+train_x.head()
 
 # COMMAND ----------
 
@@ -351,36 +473,37 @@ test_df = ps.concat([test_y, test_x], axis=1)
 stores = test_df['store'].unique().to_numpy()
 stores = np.sort(stores,axis=0)
 
-metric_outputs= list()
-
+store_metric_outputs= list()
+item_metric_outputs = list()
 for each_store_id in stores:
     # Extract test dataset for each store
-    subset_df = test_df[test_df['store']==int(each_store_id)].copy()
-    subset_df.reset_index(drop=True, inplace=True)
-    subset_test_x = subset_df.loc[:, subset_df.columns != 'sales']
-    subset_test_y = subset_df['sales']
+    store_df = test_df[test_df['store']==int(each_store_id)].copy()
+    store_df.reset_index(drop=True, inplace=True)
+    store_test_x = store_df.loc[:, store_df.columns != 'sales']
+    store_test_y = store_df['sales']
     
-    # Predict on a Pandas DataFrame
-    predictions = loaded_model.predict(subset_test_x.to_numpy())
-    rmse = mean_squared_error(subset_test_y.values, predictions)
-    mape = mean_absolute_percentage_error(subset_test_y.values, predictions)
+    # Predict on a Pandas DataFrame - at store level
+    predictions = loaded_model.predict(store_test_x.to_numpy())
+    rmse = mean_squared_error(store_test_y.values, predictions)
+    mape = mean_absolute_percentage_error(store_test_y.values, predictions)
     
-    metric_outputs.append([each_store_id, rmse, mape])
+    store_metric_outputs.append([each_store_id, rmse, mape])
 
-results_df = pd.DataFrame(metric_outputs,columns=['Store Id','RMSE','MAPE'])
+store_results_df = pd.DataFrame(store_metric_outputs,columns=['StoreId','RMSE','MAPE'])
+#item_results_df = pd.DataFrame(item_metric_outputs,columns=['StoreId','ItemId','RMSE','MAPE'])
 
 plt.figure(figsize=(10,5))
 plt.subplot(1,2,1)
-plt.plot(results_df['MAPE'])
-plt.axhline(y=np.nanmean(results_df['MAPE']),linewidth=2, color='r')
+plt.plot(store_results_df['MAPE'])
+plt.axhline(y=np.nanmean(store_results_df['MAPE']),linewidth=2, color='r')
 plt.xlabel("Stores")
 plt.ylabel("MMAPE")
 plt.title("MAPE for each store")
 plt.subplot(1,2,2)
 plt.xlabel("Stores")
 plt.ylabel("RMSE")
-plt.plot(results_df['RMSE'])
-plt.axhline(y=np.nanmean(results_df['RMSE']),linewidth=2, color='r')
+plt.plot(store_results_df['RMSE'])
+plt.axhline(y=np.nanmean(store_results_df['RMSE']),linewidth=2, color='r')
 plt.title("RMSE for each store")
 
 # COMMAND ----------
