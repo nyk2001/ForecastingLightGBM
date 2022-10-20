@@ -49,7 +49,8 @@ import os
 import pyspark.pandas as ps
 
 # Read pandas dataframe
-data_df = pd.read_csv(os.path.join(os.getcwd(),'train.csv'))
+data_path = os.path.join(os.getcwd(),'train.csv')
+data_df = pd.read_csv(data_path)
 data_df['date'] = pd.to_datetime(data_df['date'])
 print(type(data_df))
 # Convert pandas to pandas API
@@ -273,6 +274,10 @@ def train_model(train_x,train_y,test_x,test_y,iterations, search_params):
 # COMMAND ----------
 
 import mlflow 
+#The Model signature defines the schema of a model's inputs and outputs. Model inputs and outputs can be either column-based or tensor-based.
+from mlflow.models.signature import infer_signature
+from mlflow.tracking.client import MlflowClient
+
 experiment_id =-1
 run_id =-1
 
@@ -282,18 +287,40 @@ except Exception as e:
     experiment_details = mlflow.get_experiment_by_name("/Users/nabekhan@deloitte.com.au/forecasting-lightgbm")
     experiment_id = experiment_details.experiment_id
 
-with mlflow.start_run(run_name= "LightGBM", experiment_id=experiment_id) as run:
-    mlflow.lightgbm.autolog()
+project_description = ("Train LightGBM model without any parameter tuning. The trained model may not perform very well on test data as it is not optimized")
+with mlflow.start_run(run_name= "LightGBM", 
+                      tags={"Problem": "Timeseries forecasting", 
+                             "mlflow.note.content": project_description}, 
+                      experiment_id=experiment_id) as run:
+    mlflow.lightgbm.autolog(log_input_examples=True, log_model_signatures=True, log_models=True)
     model , score = train_model(train_x,train_y,val_x,val_y,3000, {})
-    mlflow.log_param("mape", score)
+    
     print('The best MAPE for validation = %0.3f'%score)
     ax = lgb.plot_importance(model, max_num_features=10)
     fig = plt.gcf()
     mlflow.log_figure(fig, "feature_importance.png")
     plt.close(fig)
+    signature = infer_signature(train_x.to_numpy(), model.predict(train_x.to_numpy()))
     
-    run = mlflow.active_run()
-    run_id = run.info.run_id
+    mlflow.log_metric("mape", score)
+    mlflow.log_param("model", "lightGBM")
+    mlflow.log_artifact(data_path, artifact_path="train_data")
+    
+# Getting the current run id
+run_id = run.info.run_id
+
+# Register the model
+model_uri = f"runs:/{run_id}/model"
+model_name= 'lightGBM_simple_model'
+model_details = mlflow.register_model(model_uri=model_uri, name=model_name)
+
+# Update model details
+client = MlflowClient()
+model_version_details = client.get_model_version(name=model_name, version=1)
+print(model_version_details)
+
+client.update_model_version(name=model_details.name,version=model_details.version,
+    description="This model predicts time series forecasting.")
 
 # COMMAND ----------
 
@@ -313,6 +340,43 @@ print("The best MAPE score for validation dataset = %0.3f"%score)
 print("RMSE on test dataset is = %0.3f"%rmse)
 print("MAPE on test dataset is = %0.3f"%mape)
 
+# Computing RMSE and MAPE for each individual store
+test_df = ps.concat([test_y, test_x], axis=1)
+stores = test_df['store'].unique().to_numpy()
+stores = np.sort(stores,axis=0)
+
+metric_outputs= list()
+
+for each_store_id in stores:
+    # Extract test dataset for each store
+    subset_df = test_df[test_df['store']==int(each_store_id)].copy()
+    subset_df.reset_index(drop=True, inplace=True)
+    subset_test_x = subset_df.loc[:, subset_df.columns != 'sales']
+    subset_test_y = subset_df['sales']
+    
+    # Predict on a Pandas DataFrame
+    predictions = loaded_model.predict(subset_test_x.to_numpy())
+    rmse = mean_squared_error(subset_test_y.values, predictions)
+    mape = mean_absolute_percentage_error(subset_test_y.values, predictions)
+    
+    metric_outputs.append([each_store_id, rmse, mape])
+
+results_df = pd.DataFrame(metric_outputs,columns=['Store Id','RMSE','MAPE'])
+
+plt.figure(figsize=(10,5))
+plt.subplot(1,2,1)
+plt.plot(results_df['MAPE'])
+plt.axhline(y=np.nanmean(results_df['MAPE']),linewidth=2, color='r')
+plt.xlabel("Stores")
+plt.ylabel("MMAPE")
+plt.title("MAPE for each store")
+plt.subplot(1,2,2)
+plt.xlabel("Stores")
+plt.ylabel("RMSE")
+plt.plot(results_df['RMSE'])
+plt.axhline(y=np.nanmean(results_df['RMSE']),linewidth=2, color='r')
+plt.title("RMSE for each store")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -330,7 +394,6 @@ def objective_function(params):
             'boosting_type': 'gbdt',
             'objective': 'regression_l1',
             'metric': 'mape', 
-           'bagging_fraction': 0.8,
             'bagging_freq': 5,
             'lambda_l1': 3.097758978478437,
             'lambda_l2': 2.9482537987198496,
@@ -339,7 +402,9 @@ def objective_function(params):
             'min_split_gain': 0.037310344962162616,
             'learning_rate' : params['lr'],
             'max_depth': int(params['max_depth']), 
-            'num_leaves': int(params['num_leaves'])
+            'num_leaves': int(params['num_leaves']),
+            'bagging_fraction': params['bagging_fraction'],
+            'feature_fraction' : params['feature_fraction']
     }
     
     # Extract datasets
@@ -378,12 +443,14 @@ search_space = {
         'max_depth': hp.quniform('max_depth', 3,19,1),
         'num_leaves': hp.quniform('num_leaves', 3, 19,1),
         'lgb_train': lgb_train,
-        'lgb_valid': lgb_valid
+        'lgb_valid': lgb_valid,
+        'bagging_fraction':  hp.uniform('bagging_fraction', 0.8,1.0),
+        'feature_fraction' : hp.uniform('feature_fraction', 0.8,1.0)
 }
 
 experiment_id =-1
 
-num_evals = 15
+num_evals = 30
 trials = Trials()
 best_hyperparameter = fmin(
         fn=objective_function,
@@ -403,10 +470,19 @@ print("Best Hyperparameters")
 print("Depth = %d"%best_hyperparameter['max_depth'])
 print("Learning Rate = %f"%best_hyperparameter['lr'])
 print("Number of leaves = %d"%best_hyperparameter['num_leaves'])
+print("Bagging fraction = %d"%best_hyperparameter['bagging_fraction'])
+print("Feature fraction = %d"%best_hyperparameter['feature_fraction'])
 
 
 
 # COMMAND ----------
+
+print("Best Hyperparameters")
+print("Depth = %d"%best_hyperparameter['max_depth'])
+print("Learning Rate = %f"%best_hyperparameter['lr'])
+print("Number of leaves = %d"%best_hyperparameter['num_leaves'])
+print("Bagging fraction = %f"%best_hyperparameter['bagging_fraction'])
+print("Feature fraction = %f"%best_hyperparameter['feature_fraction'])
 
 run_id =-1
 with mlflow.start_run(experiment_id = experiment_id, 
@@ -416,8 +492,10 @@ with mlflow.start_run(experiment_id = experiment_id,
     
     # Updatinng the best paramters
     seearch_space = {"max_depth":int(best_hyperparameter['max_depth']),
-                    "learning_rate":best_hyperparameter['lr'] ,
-                    "num_leaves":int(best_hyperparameter['num_leaves'])}
+                    "learning_rate":best_hyperparameter['lr'],
+                    "num_leaves":int(best_hyperparameter['num_leaves']),
+                    "bagging_fraction":best_hyperparameter['bagging_fraction'],
+                    "feature_fraction": best_hyperparameter['feature_fraction']}
         
     # Train model
     forecast_model , score = train_model(train_x,train_y,val_x,val_y,3000, seearch_space)
@@ -434,9 +512,11 @@ with mlflow.start_run(experiment_id = experiment_id,
     plt.close(fig)
     
     # Log param and metrics for the final model
-    mlflow.log_param("maxDepth", best_hyperparameter['max_depth'])
-    mlflow.log_param("numLeaves", best_hyperparameter['num_leaves'])
+    mlflow.log_metric("maxDepth", best_hyperparameter['max_depth'])
+    mlflow.log_metric("numLeaves", best_hyperparameter['num_leaves'])
     mlflow.log_metric("learningRate", best_hyperparameter['lr'])
+    mlflow.log_metric("bagging_fraction", best_hyperparameter['bagging_fraction'])
+    mlflow.log_metric("feature_fraction", best_hyperparameter['feature_fraction'])
     
     # Get run ids
     run = mlflow.active_run()
@@ -460,6 +540,44 @@ mape = mean_absolute_percentage_error(test_y.values, predictions)
 print("The best MAPE score for validation dataset = %0.3f"%score)
 print("RMSE on test dataset is = %0.3f"%rmse)
 print("MAPE on test dataset is = %0.3f"%mape)
+
+# Computing RMSE and MAPE for each individual store
+test_df = ps.concat([test_y, test_x], axis=1)
+stores = test_df['store'].unique().to_numpy()
+stores = np.sort(stores,axis=0)
+
+metric_outputs= list()
+
+for each_store_id in stores:
+    # Extract test dataset for each store
+    subset_df = test_df[test_df['store']==int(each_store_id)].copy()
+    subset_df.reset_index(drop=True, inplace=True)
+    subset_test_x = subset_df.loc[:, subset_df.columns != 'sales']
+    subset_test_y = subset_df['sales']
+    
+    # Predict on a Pandas DataFrame
+    predictions = loaded_model.predict(subset_test_x.to_numpy())
+    rmse = mean_squared_error(subset_test_y.values, predictions)
+    mape = mean_absolute_percentage_error(subset_test_y.values, predictions)
+    
+    metric_outputs.append([each_store_id, rmse, mape])
+
+results_df = pd.DataFrame(metric_outputs,columns=['Store Id','RMSE','MAPE'])
+
+plt.figure(figsize=(10,5))
+plt.subplot(1,2,1)
+plt.plot(results_df['MAPE'])
+plt.axhline(y=np.nanmean(results_df['MAPE']),linewidth=2, color='r')
+plt.xlabel("Stores")
+plt.ylabel("MMAPE")
+plt.title("MAPE for each store")
+
+plt.subplot(1,2,2)
+plt.xlabel("Stores")
+plt.ylabel("RMSE")
+plt.plot(results_df['RMSE'])
+plt.axhline(y=np.nanmean(results_df['RMSE']),linewidth=2, color='r')
+plt.title("RMSE for each store")
 
 # COMMAND ----------
 
