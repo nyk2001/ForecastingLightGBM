@@ -45,12 +45,26 @@ warnings.filterwarnings("ignore")
 # COMMAND ----------
 
 import os
+import pyspark.pandas as ps
 
 # Read csv data into pandas dataframe
-data_path = os.path.join(os.getcwd(),'train.csv')
-data_df = pd.read_csv(data_path)
-print("Total elements = %d"%data_df.shape[0])
+#data_path = os.path.join(os.getcwd(),'train.csv')
+#print(data_path)
+#data_df = ps.read_csv(data_path)
 
+# Assuming we already have a table sales_train_data in defaule Hive database
+spark_df=spark.sql("select * from sales_train_data")
+#spark_df= spark_df.coalesce(1)
+#print(spark_df.rdd.getNumPartitions())
+#ps.set_option("compute.default_index_type", "sequence")
+# Converting pyspark to pandas API
+data_df= ps.DataFrame(spark_df)
+print("Total elements = %d"%data_df.shape[0])
+print("Type of frame = %s"%type(data_df))
+
+# COMMAND ----------
+
+data_df.head()
 
 # COMMAND ----------
 
@@ -64,7 +78,7 @@ from pyspark.pandas.config import set_option, reset_option
 set_option("compute.ops_on_diff_frames", True)
 
 def create_date_features(df):
-    data_df['date'] = pd.to_datetime(data_df['date'])
+    data_df['date'] = ps.to_datetime(data_df['date'])
     df['month'] = df['date'].dt.month
     df['day'] = df['date'].dt.dayofweek
     df['year'] = df['date'].dt.year    
@@ -76,14 +90,17 @@ def create_date_features(df):
     
     return df
 
-
+# Generate time features based on the date column
 data_df = create_date_features(data_df)
 data_df.head()
 
 
 # COMMAND ----------
 
-print("Total elements = %d"%data_df.shape[0])
+# save features to a table
+def write_data_hive(df, table_name):
+    spark_df = df.to_spark()
+    spark_df.write.format("delta").mode("overwrite").saveAsTable(table_name)
 
 # COMMAND ----------
 
@@ -100,6 +117,7 @@ print("Total elements = %d"%data_df.shape[0])
 
 # COMMAND ----------
 
+from pyspark.sql.functions import lit
 # Let's first create "Random Noise" function, for using when we want 
 def random_noise(dataframe):
     return np.random.normal(scale=1.6, size=(len(dataframe),)) # Gaussian random noise
@@ -109,21 +127,27 @@ def random_noise(dataframe):
 # Since we will create more than 1 "Lag/Shifted Features" I created that function.
 def create_lagged_features(df, lags):
     for lag in lags:
-        df['sales_lag_' + str(lag)] = df.groupby(["store", "item"])['sales'].transform(lambda x: x.shift(lag))+ random_noise(df)
+        df['sales_lag_' + str(lag)] = df.groupby(["store", "item"])['sales'].transform(lambda x: x.shift(lag)) 
+        #+ lit(random_noise(df)) 
     return df
 
 
 #def create_lagged_features(df):    
 #    # Let's see an example : With this code we generate 'lag1' feature for ecah unique 'item' in each 'store' separately.
-#    df['lag_1']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(1))
-#    df['lag_2']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(2))
+#data_df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(1))[0:10]
+#data_df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(2))[0:10]
 #    df['lag_3']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(3))
 #    
 #    return df
-print("Total elements = %d"%data_df.shape[0])
+#print("Total elements = %d"%data_df.shape[0])
 lagged_data_df = create_lagged_features(data_df,[1,3,5,7])
 print("Total elements = %d"%lagged_data_df.shape[0])
-lagged_data_df.head(10)   
+lagged_data_df = lagged_data_df.sort_index(ascending=True)
+lagged_data_df.head(15)   
+
+# COMMAND ----------
+
+write_data_hive(lagged_data_df, "sale_train_lagged_data")
 
 # COMMAND ----------
 
@@ -139,27 +163,54 @@ lagged_data_df.head(10)
 
 # COMMAND ----------
 
+
+
 # Let's create "rolling mean features".
 def roll_mean_features(df, windows):
     for window in windows:
         df['sales_roll_mean_' + str(window)] = df.groupby(["store", "item"])['sales'].\
-        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).mean()) + random_noise(df)
+        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).mean())# + random_noise(df)
     return df
 
 # Let's create "rolling sum features".
 def roll_sum_features(df, windows):
     for window in windows:
         df['sales_roll_sum_' + str(window)] = df.groupby(["store", "item"])['sales'].\
-        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).sum()) + random_noise(df)
+        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).sum()) #+ random_noise(df)
     return df
 
 # Using two window sizes
 windows_size = [3,7] 
 rolled_data_df = roll_mean_features(lagged_data_df, windows_size)
+rolled_data_df = rolled_data_df.sort_index(ascending=True)
 rolled_data_df = roll_sum_features(rolled_data_df, windows_size)
+rolled_data_df = rolled_data_df.sort_index(ascending=True)
 print("Total elements = %d"%rolled_data_df.shape[0])
 rolled_data_df.head(10)  
 
+
+# COMMAND ----------
+
+write_data_hive(rolled_data_df, "sale_train_lagged_rolled_data")
+
+# COMMAND ----------
+
+import os
+import pyspark.pandas as ps
+
+# Assuming we already have a table sales_train_data in defaule Hive database
+spark_df=spark.sql("select * from sale_train_lagged_rolled_data")
+#spark_df= spark_df.coalesce(1)
+#print(spark_df.rdd.getNumPartitions())
+#ps.set_option("compute.default_index_type", "sequence")
+# Converting pyspark to pandas API
+rolled_data_df= ps.DataFrame(spark_df)
+print("Total elements = %d"%rolled_data_df.shape[0])
+print("Type of frame = %s"%type(rolled_data_df))
+
+# COMMAND ----------
+
+rolled_data_df.head()
 
 # COMMAND ----------
 
@@ -179,6 +230,10 @@ print("Total elements = %d"%rolled_data_df.shape[0])
 
 # COMMAND ----------
 
+# Generating extra features such as week of year, day of week etc
+from pyspark.pandas.config import set_option, reset_option
+set_option("compute.ops_on_diff_frames", True)
+
 # Let's create 'Exponentially Weighted Mean Features' 
 def ewm_features(df, alphas, lags):
     for alpha in alphas:
@@ -193,7 +248,12 @@ alphas = [1.0, 0.95]
 lags = [3,7]
 
 final_data_df = ewm_features(rolled_data_df, alphas, lags)
+final_data_df = final_data_df.sort_index(ascending=True)
 final_data_df.head(10)
+
+# COMMAND ----------
+
+write_data_hive(final_data_df, "sale_train_final_data")
 
 # COMMAND ----------
 
@@ -202,7 +262,6 @@ print("Total elements = %d"%final_data_df.shape[0])
 
 # COMMAND ----------
 
-import pyspark.pandas as ps
 
 print("Total elements = %d"%final_data_df.shape[0])
 final_data_df.dropna(inplace=True)
@@ -219,19 +278,34 @@ pd_spark_df.head()
 
 # COMMAND ----------
 
+import os
+import pyspark.pandas as ps
+
+# Assuming we already have a table sales_train_data in defaule Hive database
+spark_df=spark.sql("select * from sale_train_final_data")
+#spark_df= spark_df.coalesce(1)
+#print(spark_df.rdd.getNumPartitions())
+#ps.set_option("compute.default_index_type", "sequence")
+# Converting pyspark to pandas API
+final_data_df= ps.DataFrame(spark_df)
+print("Total elements = %d"%final_data_df.shape[0])
+print("Type of frame = %s"%type(final_data_df))
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC Splitting train data into train, test, and validation datasets
 
 # COMMAND ----------
 
 import random
-
+import numpy as np
 def test_train_split_timeseries_data(data_df, split_ratio, random_ratio= False):
     
     train_split = split_ratio
     
     # Find the unique store ids
-    unique_elements = pd_spark_df['store'].unique().to_numpy()
+    unique_elements = data_df['store'].unique().to_numpy()
     unique_elements= np.sort(unique_elements,axis=0)
     
     # Creating new train and test data sets
@@ -270,7 +344,7 @@ def test_train_split_timeseries_data(data_df, split_ratio, random_ratio= False):
     return df_train[col],df_train[y], df_test[col], df_test[y],df_train, df_test
 
 # Use 80% for training and 20% for testing
-temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(pd_spark_df,0.8)
+temp_x, temp_y, test_x, test_y, df_train, df_test = test_train_split_timeseries_data(final_data_df,0.8)
 # Use 80%for training and 20% for validation
 train_x, train_y, val_x, val_y, df_train, df_test = test_train_split_timeseries_data(df_train, 0.8)
 
@@ -401,12 +475,16 @@ def train_model(train_x,train_y,test_x,test_y,iterations, search_params):
 # COMMAND ----------
 
 import mlflow 
+
+
 #The Model signature defines the schema of a model's inputs and outputs. Model inputs and outputs can be either column-based or tensor-based.
 from mlflow.models.signature import infer_signature
 from mlflow.tracking.client import MlflowClient
 
 experiment_id =-1
 run_id =-1
+
+data_path = os.path.join(os.getcwd(),'train.csv')
 
 try:
     experiment_id = mlflow.create_experiment("/Users/nabekhan@deloitte.com.au/forecasting-lightgbm")
@@ -432,7 +510,6 @@ with mlflow.start_run(run_name= "LightGBM",
     
     mlflow.log_metric("mape", score)
     mlflow.log_param("model", "lightGBM")
-    mlflow.log_artifact(data_path, artifact_path="train_data")
     
 # Getting the current run id
 run_id = run.info.run_id
@@ -601,8 +678,6 @@ print("Learning Rate = %f"%best_hyperparameter['lr'])
 print("Number of leaves = %d"%best_hyperparameter['num_leaves'])
 print("Bagging fraction = %d"%best_hyperparameter['bagging_fraction'])
 print("Feature fraction = %d"%best_hyperparameter['feature_fraction'])
-
-
 
 # COMMAND ----------
 
