@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC ### Install LightGBM Library
+# MAGIC # Install LightGBM Library
 
 # COMMAND ----------
 
@@ -9,7 +9,7 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Introduction
+# MAGIC # Introduction
 # MAGIC 
 # MAGIC Kernel for the [demand forecasting](https://www.kaggle.com/c/demand-forecasting-kernels-only) Kaggle competition.
 # MAGIC 
@@ -23,53 +23,62 @@
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC ### Load Packages
+# MAGIC # Load Packages
 
 # COMMAND ----------
 
 import pandas as pd
 import numpy as np
-from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
+from datetime import datetime
 import warnings
 warnings.filterwarnings("ignore")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Load data in pandas
+# MAGIC # Load data in PySpark and Pandas Dataframe API
 
 # COMMAND ----------
 
 import os
 import pyspark.pandas as ps
 
-# Read csv data into pandas dataframe
-#data_path = os.path.join(os.getcwd(),'train.csv')
-#print(data_path)
-#data_df = ps.read_csv(data_path)
-
-# Assuming we already have a table sales_train_data in defaule Hive database
+# Assuming we already have a table sales_train_data in default Hive database
 spark_df=spark.sql("select * from sales_train_data")
-#spark_df= spark_df.coalesce(1)
-#print(spark_df.rdd.getNumPartitions())
-#ps.set_option("compute.default_index_type", "sequence")
-# Converting pyspark to pandas API
-data_df= ps.DataFrame(spark_df)
-print("Total elements = %d"%data_df.shape[0])
-print("Type of frame = %s"%type(data_df))
+
+# Converting table to pandas API data frame - comparison
+#pandas_df_api= ps.DataFrame(spark_df)
+pandas_df_api= spark_df.toPandas()
+
+print("Total elements = %d"%pandas_df_api.shape[0])
+print("Type of frame = %s"%type(pandas_df_api))
 
 # COMMAND ----------
 
-data_df.head()
+spark_df.limit(5).show()
+
+# COMMAND ----------
+
+pandas_df_api.head()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Feature Engineering
+# MAGIC # Feature Engineering
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Date fetaures from date
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Using Pandas Datafram API
 
 # COMMAND ----------
 
@@ -77,35 +86,148 @@ data_df.head()
 from pyspark.pandas.config import set_option, reset_option
 set_option("compute.ops_on_diff_frames", True)
 
-def create_date_features(df):
-    data_df['date'] = ps.to_datetime(data_df['date'])
+# Creates date features using pandas data frame api
+# Input
+#   --> Pandas API Dataframe
+# Output
+#   Dataframe with various time outputs
+def create_date_features_pandas(df):
+    df['date'] = ps.to_datetime(df['date'])
     df['month'] = df['date'].dt.month
-    df['day'] = df['date'].dt.dayofweek
+    df['day'] = df['date'].dt.day
     df['year'] = df['date'].dt.year    
     df['week_of_year'] = df['date'].dt.weekofyear # Which week of the corresponding year
     df['day_of_week'] = df['date'].dt.dayofweek # Which day of the corresponding week of the each month
-    df["is_wknd"] = df.date.dt.weekday // 4
+    df["is_weekend"] = (df.date.dt.weekday // 5).astype(int)
     df['is_month_start'] = df['date'].dt.is_month_start.astype(int) # Is it starting of the corresponding month
     df['is_month_end'] = df['date'].dt.is_month_end.astype(int) # Is it ending of the corresponding month
     
     return df
 
 # Generate time features based on the date column
-data_df = create_date_features(data_df)
-data_df.head()
+pandas_df_api_v1 = create_date_features_pandas(pandas_df_api)
+pandas_df_api_v1.head()
 
-
-# COMMAND ----------
-
-# save features to a table
-def write_data_hive(df, table_name):
-    spark_df = df.to_spark()
-    spark_df.write.format("delta").mode("overwrite").saveAsTable(table_name)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC #### Lagged features
+# MAGIC Using PySpark
+
+# COMMAND ----------
+
+from pyspark.sql.types import DateType, FloatType, IntegerType
+from pyspark.sql.functions import year, month, dayofmonth, to_date, col, weekofyear, dayofweek,last_day,to_timestamp
+
+# Creates date features using pandas data frame api
+# Creates date features using pandas data frame api
+# Input
+#   --> Pandas API Dataframe
+# Output
+#   Dataframe with various time outputs
+def create_date_features_pyspark(df):
+    df = df.withColumn("date", to_date(col("date"),"MM-dd-yyyy")) 
+    df = df.withColumn("timestamp", to_timestamp(col("date"))) 
+    df = df.withColumn("month",month(df['date']))
+    df = df.withColumn("day",dayofmonth(df['date']))
+    df = df.withColumn("year",year(df['date']))
+    df = df.withColumn("week_of_year",weekofyear(df['date']))
+    df = df.withColumn("day_of_week",((dayofweek(df['date'])+5)%7))
+    df = df.withColumn("is_weekend", dayofweek(df['date']).isin([7,1]).cast(IntegerType()))
+    df = df.withColumn("is_month_start", (dayofmonth(df['date'])==1).cast(IntegerType()))
+    df = df.withColumn("is_month_end", ((dayofmonth(last_day(df['date'])))==dayofmonth(df['date'])).cast(IntegerType()))
+    
+    return df
+
+# Create pyspark data frame 
+spark_df_v1= create_date_features_pyspark(spark_df)
+spark_df_v1.limit(10).show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Create subset of data
+
+# COMMAND ----------
+
+#df1 =spark_df_v1.filter(((col("store")==1) & (col("item")==1) & (col("month")==1) & (col("day")<=15) & (col("year")==2013)) | ((col("store")==1) & (col("item")==2) & (col("month")==1) & (col("day")<=15) & #(col("year")==2013)))
+#spark_df_v1 = df1
+#pandas_df_api_v1 = spark_df_v1.toPandas()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Misc Functions
+
+# COMMAND ----------
+
+from pyspark.sql import DataFrame
+##############################################################################
+# Save table to a default schema 
+##############################################################################
+# Input
+#  --> Dataframe. Can be pandas or spark
+#  --> Table name
+# Output
+#  --> None
+def write_data_hive(df, table_name):
+    # Convert from pandas API data frame to spark data frame
+    if not isinstance(df, DataFrame):
+        df = df.to_spark()
+    
+    # Write on disc
+    df.write.format("delta").mode("overwrite").saveAsTable(table_name)
+
+##############################################################################
+# Compare column values between pandas and PySpark data frame
+##############################################################################
+# Input
+#  --> Pyspark dataframe
+#  --> Pandas dataframe
+#  --> Group cols, such as ['store', 'item','date']
+#  --> List of columns to be compared
+# Output
+#  --> None
+def comapre_data(spark_df, pandas_df, group_cols, col_names):
+    # Converting all data frames to Pandas API
+    df1 = ps.DataFrame(spark_df)
+    df2 = ps.DataFrame(pandas_df)
+    
+    # Sort by columns
+    df1= df1.sort_values(by=group_cols)
+    df2= df2.sort_values(by=group_cols)
+    
+    # Reset indices
+    df1.reset_index(drop=True, inplace=True)
+    df2.reset_index(drop=True, inplace=True)
+
+    for col_name in col_names:
+        
+        # Fill all null values with a dummy value
+        df1[col_name] = df1[col_name].fillna(-1000)
+        df2[col_name] = df2[col_name].fillna(-1000)
+        
+        # Select a subset of columns
+        df3 = df1[['date','store', 'item','sales',col_name]].copy()
+        df4 = df2[['date','store', 'item',col_name]].copy()
+        
+        # Merging two data frames
+        df_joined= df3.merge(df4, on = ['date', 'store','item'] , how="inner")
+        df_joined['diff'] = df_joined['%s_x'%col_name]- df_joined['%s_y'%col_name]
+        print(f"{col_name}: Spark dataframe rows ={df2.shape[0]}  PySpark dataframe rows = {df4.shape[0]}") 
+        print(f"Joined Dataframe rows = {df_joined.shape[0]}  Total Mismatches = {df_joined[df_joined['diff']>0.001].shape[0]}")
+
+# COMMAND ----------
+
+## Writing data as a hive table
+#table_name = 'sales_data'
+#write_data_hive(spark_df_v1, 'sale_data_v1')
+#write_data_hive(pandas_df_api_v1, 'sale_data_v1')
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Lagged features
 
 # COMMAND ----------
 
@@ -117,42 +239,93 @@ def write_data_hive(df, table_name):
 
 # COMMAND ----------
 
-from pyspark.sql.functions import lit
-# Let's first create "Random Noise" function, for using when we want 
-def random_noise(dataframe):
-    return np.random.normal(scale=1.6, size=(len(dataframe),)) # Gaussian random noise
-
-
-# And let's create "Lag/Shifted Features" by using this function
-# Since we will create more than 1 "Lag/Shifted Features" I created that function.
-def create_lagged_features(df, lags):
-    for lag in lags:
-        df['sales_lag_' + str(lag)] = df.groupby(["store", "item"])['sales'].transform(lambda x: x.shift(lag)) 
-        #+ lit(random_noise(df)) 
-    return df
-
-
-#def create_lagged_features(df):    
-#    # Let's see an example : With this code we generate 'lag1' feature for ecah unique 'item' in each 'store' separately.
-#data_df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(1))[0:10]
-#data_df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(2))[0:10]
-#    df['lag_3']= df.groupby(["store", "item"])[['sales']].transform(lambda x: x.shift(3))
-#    
-#    return df
-#print("Total elements = %d"%data_df.shape[0])
-lagged_data_df = create_lagged_features(data_df,[1,3,5,7])
-print("Total elements = %d"%lagged_data_df.shape[0])
-lagged_data_df = lagged_data_df.sort_index(ascending=True)
-lagged_data_df.head(15)   
+# MAGIC %md
+# MAGIC Using Pandas  - Pandas Dataframe API will be very slow
 
 # COMMAND ----------
 
-write_data_hive(lagged_data_df, "sale_train_lagged_data")
+from pyspark.sql.functions import lit
+
+# And let's create "Lag/Shifted Features" by using this function
+# Creating lagged features
+# Inputs:
+#    --> Pandas Data frame 
+#    --> Lag values, such as 1 , 3 , 5
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> lag column suffix, such as lag
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pandas dataframe with new columns
+def create_lagged_features_pandas(df, lags,group_cols,  target_col_name, lag_suffix, random_noise= False):
+    # Creating col for each lag
+    for lag in lags:
+        df[target_col_name + "_"+ lag_suffix+ "_" + str(lag)] = df.groupby(group_cols)[target_col_name].transform(lambda x: x.shift(lag)) 
+    
+    return df
+
+# Lagged windows 
+lag_window= [1,3,5,7]
+
+# Generate lagged features
+pandas_df_api_v2 = create_lagged_features_pandas(pandas_df_api_v1,lag_window,["store", "item"],"sales", "lag")
+print("Total elements = %d"%pandas_df_api_v2.shape[0])
+pandas_df_api_v2 = pandas_df_api_v2.sort_values(by=["store", "item","date"], ascending=True)
+pandas_df_api_v2.head(10)   
+
+# COMMAND ----------
+
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+import numpy as np
+
+# Creating lagged features
+# Inputs:
+#    --> Pyspark Data frame 
+#    --> Lag values, such as 1 , 3 , 5
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> lag column suffix, such as lag
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pyspark dataframe with new columns
+def create_lagged_features_pyspark(df,lags,group_cols, target_col_name, lag_suffix, random_noise=False):
+    
+    # Defining the window to be used to generate lagged features
+    w = Window().partitionBy(['store','item']).orderBy(group_cols)
+
+    # Add ranom noise (if needed) - Disabled at the moment
+    random_df = np.random.normal(scale=1.6, size=(df.count(),))    
+    
+    # Generating lags
+    for lag in lags:
+        df = df.withColumn(f"{target_col_name}_{lag_suffix}_{lag}", F.lag(F.col(target_col_name), lag).over(w)) 
+        
+    return df
+
+# Lag windows
+lag_window= [1,3,5,7]
+
+# Generating lagged features pyspark
+spark_df_v2 = create_lagged_features_pyspark(spark_df_v1, lag_window,['store','item'],"sales","lag")
+spark_df_v2= spark_df_v2.orderBy("store","item","date")
+spark_df_v2.show()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC #### Rolling Window
+# MAGIC Comparing columns between Pandas and PySpark dataframe
+
+# COMMAND ----------
+
+# Comapring columns
+col_list=['sales_lag_1','sales_lag_3','sales_lag_5','sales_lag_7']
+comapre_data(spark_df_v2,pandas_df_api_v2,['store', 'item','date'], col_list)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Rolling Window
 
 # COMMAND ----------
 
@@ -163,63 +336,115 @@ write_data_hive(lagged_data_df, "sale_train_lagged_data")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Pandas Dataframe- Pandas API very slow
 
+# COMMAND ----------
 
-# Let's create "rolling mean features".
-def roll_mean_features(df, windows):
-    for window in windows:
-        df['sales_roll_mean_' + str(window)] = df.groupby(["store", "item"])['sales'].\
-        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).mean())# + random_noise(df)
-    return df
-
-# Let's create "rolling sum features".
-def roll_sum_features(df, windows):
-    for window in windows:
-        df['sales_roll_sum_' + str(window)] = df.groupby(["store", "item"])['sales'].\
-        transform(lambda x: x.shift(1).rolling(window=window, min_periods=int(window/2)).sum()) #+ random_noise(df)
+# Let's create "rolling mean features"
+# Creating rolling window features
+# Inputs:
+#    --> Pandas Data frame 
+#    --> Windows values, such as 3 , 5 , 7
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> Roll column suffix, such as lag
+#    --> Operation can be sum or mean
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pandas dataframe with new columns
+def create_window_rolling_features(df, window_sizes,group_cols, target_col_name,rolling_suffix, operation, random_noise= False):
+    
+    for window_size in window_sizes:
+        if operation == "sum":
+            df["sales" + "_" +rolling_suffix+"_" + operation + "_" + str(window_size)] = df.groupby(group_cols)[target_col_name].\
+                transform(lambda x: x.rolling(window=window_size, center= True,min_periods=1).sum())
+        if operation =="mean":
+            df["sales" + "_" + rolling_suffix+"_"+ operation + "_" + str(window_size)] = df.groupby(group_cols)[target_col_name].\
+                transform(lambda x: x.rolling(window=window_size,center= True,min_periods=1).mean())
+        if operation =="std":
+            df["sales" + "_" + rolling_suffix+"_"+ operation + "_" + str(window_size)] = df.groupby(group_cols)[target_col_name].\
+                transform(lambda x: x.rolling(window=window_size,center= True,min_periods=1).std())
+        
     return df
 
 # Using two window sizes
-windows_size = [3,7] 
-rolled_data_df = roll_mean_features(lagged_data_df, windows_size)
-rolled_data_df = rolled_data_df.sort_index(ascending=True)
-rolled_data_df = roll_sum_features(rolled_data_df, windows_size)
-rolled_data_df = rolled_data_df.sort_index(ascending=True)
-print("Total elements = %d"%rolled_data_df.shape[0])
-rolled_data_df.head(10)  
-
+windows_sizes = [3,5,7] 
+pandas_df_api_v2 = pandas_df_api_v2.sort_values(by= ["store","item","date"], ascending=True)
+pandas_df_api_v3 = create_window_rolling_features(pandas_df_api_v2, windows_sizes,["store", "item"], "sales", "roll", "sum")
+pandas_df_api_v3 = create_window_rolling_features(pandas_df_api_v3, windows_sizes,["store", "item"], "sales", "roll", "mean")
+pandas_df_api_v3 = create_window_rolling_features(pandas_df_api_v3, windows_sizes,["store", "item"], "sales", "roll", "std")
+pandas_df_api_v3.head(10)  
 
 # COMMAND ----------
 
-write_data_hive(rolled_data_df, "sale_train_lagged_rolled_data")
-
-# COMMAND ----------
-
-import os
 import pyspark.pandas as ps
+from pyspark.sql import *
+ps.set_option('compute.ops_on_diff_frames', True)
 
-# Assuming we already have a table sales_train_data in defaule Hive database
-spark_df=spark.sql("select * from sale_train_lagged_rolled_data")
-#spark_df= spark_df.coalesce(1)
-#print(spark_df.rdd.getNumPartitions())
-#ps.set_option("compute.default_index_type", "sequence")
-# Converting pyspark to pandas API
-rolled_data_df= ps.DataFrame(spark_df)
-print("Total elements = %d"%rolled_data_df.shape[0])
-print("Type of frame = %s"%type(rolled_data_df))
+# Let's create "rolling mean features"
+# Inputs:
+#    --> Pyspark Data frame 
+#    --> Windows values, such as 3 , 5 , 7
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> Roll column suffix, such as lag
+#    --> Operation can be sum or mean
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pyspark dataframe with new columns
 
-# COMMAND ----------
+def create_rolling_features(df, window_sizes,group_cols, target_col_name,rolling_suffix, operation, random_noise= False):
+    
+    # Calculating days
+    days = lambda i: i * 86400
+    
+    for window_size in window_sizes:        
+        # Computing window delta
+        window_delta = int(window_size/2)
+        
+        # Creating window for roll feature
+        roll_window = Window().partitionBy(group_cols).orderBy(F.col("timestamp").cast('long')).rangeBetween(-days(window_delta), days(window_delta))    
+        
+        # Generate new column
+        if operation == "sum":
+            df = df.withColumn(f"{target_col_name}_{rolling_suffix}_{operation}_{window_size}", F.sum(target_col_name).over(roll_window))
+        if operation == "mean":
+            df = df.withColumn(f"{target_col_name}_{rolling_suffix}_{operation}_{window_size}", F.avg(target_col_name).over(roll_window))
+        if operation == "std":
+            df = df.withColumn(f"{target_col_name}_{rolling_suffix}_{operation}_{window_size}", F.stddev(target_col_name).over(roll_window))
+            
+    return df
 
-rolled_data_df.head()
+    
+# Using two window sizes
+windows_sizes = [3,5,7] 
 
-# COMMAND ----------
+# Generate mean and sum rolling features
+spark_df_v2 = spark_df_v2.orderBy("store","item","date")
+spark_df_v3 = create_rolling_features(spark_df_v2, windows_sizes,["store","item"], "sales", "roll", "sum")
+spark_df_v3 = create_rolling_features(spark_df_v3, windows_sizes,["store","item"], "sales", "roll", "mean")
+#spark_df_v3 = spark_df_v3.orderBy("store","item","date")
+spark_df_v3 = create_rolling_features(spark_df_v3, windows_sizes,["store","item"], "sales", "roll", "std")
+spark_df_v3 = spark_df_v3.orderBy("store","item","date")
+spark_df_v3.limit(20).toPandas().head(20)  
 
-print("Total elements = %d"%rolled_data_df.shape[0])
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC #### Exponentially Weighted Mean Features
+# MAGIC Comapring columns between Pandas Dataframe and PySpark
+
+# COMMAND ----------
+
+# Comapring columns
+col_list=['sales_roll_mean_3','sales_roll_mean_5','sales_roll_mean_7','sales_roll_sum_3','sales_roll_sum_5','sales_roll_sum_7','sales_roll_std_3','sales_roll_std_5','sales_roll_std_7']
+comapre_data(spark_df_v3,pandas_df_api_v3,['store', 'item','date'], col_list)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Exponentially Weighted Mean Features
 # MAGIC 
 # MAGIC * Another traditional "Time Series Method" is "Exponentially Weighted Mean" method. This method has parameter called _alpha_ used as smoothing factor. This parameter ranges between [0, 1]. If _alpha_ is close to 1 while taking average for last for instance 10 days(rolling mean features also was taking averages but without giving weight), it gives more _weight_ to the close days and decreases the _weight_ when going to more past days.  
 # MAGIC * You can read about this method more on internet, but briefly normally in time series forecatsing it's better to give more _weights_ to the more recent days rather tham giving same _weight_ to all past days.
@@ -229,6 +454,106 @@ print("Total elements = %d"%rolled_data_df.shape[0])
 # MAGIC * As we see when it goes more past values it decreases the _weight_
 
 # COMMAND ----------
+
+from pyspark.pandas.config import set_option, reset_option
+set_option("compute.ops_on_diff_frames", True)
+
+# Let's create 'Exponentially Weighted Mean Features' 
+# Inputs:
+#    --> Pandas Data frame 
+#    --> Alpha values, such as 1 , 0.95
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> Ewm column suffix, such as lag
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pandas dataframe with new columns
+def create_ewm_features(df, alphas,group_cols, target_col_name,ewm_suffix, random_noise= False):
+    
+    # For each alpha calculate values
+    for alpha in alphas:
+        col_name = target_col_name + "_" + ewm_suffix  + "_" + str(alpha).replace('.','_')
+        df[col_name] = \
+                df.groupby(group_cols)[target_col_name].transform(lambda x: x.ewm(alpha=alpha).mean())
+        
+    return df
+
+# In here we have two combinations : alphas and lags
+alphas = [0.75, 0.95, 1.0]
+
+pandas_df_api_v4 = create_ewm_features(pandas_df_api_v3, alphas, ["store","item"], "sales", "ewm")
+pandas_df_api_v4 = pandas_df_api_v4.sort_values(["store","item","date"])
+pandas_df_api_v4.head(20) 
+
+# COMMAND ----------
+
+from pyspark.sql.functions import pandas_udf
+from pyspark.sql.functions import PandasUDFType
+from pyspark.sql.types import DoubleType, StructField
+
+# Inputs:
+#    --> Pyspark Data frame 
+#    --> Alpha values, such as 1 , 0.95
+#    --> Cols used for grouping, can be a single column or multiple columns
+#    --> Target columm name, such as sales
+#    --> Ewm column suffix, such as lag
+#    --> Random noise True or False - adds random noise to variables (default is False)
+# Output:
+#    --> Pyspark dataframe with new columns
+
+def create_ewm_features(df, alphas,group_cols, target_col_name,ewm_suffix, random_noise= False):
+    
+    # For each alpha calculate values
+    for alpha in alphas:
+        col_name = target_col_name + "_" + ewm_suffix  + "_" + str(alpha).replace('.','_')
+        df = df.withColumn(str(col_name), F.lit(None).cast('double'))
+        
+        @pandas_udf(df.schema, PandasUDFType.GROUPED_MAP)
+        # Using Pyhton function to compute stats for each group
+        def ema(pdf):
+            col_name = target_col_name + "_" + ewm_suffix + "_" + str(alpha).replace('.','_')
+            pdf[str(col_name)] = pdf[target_col_name].ewm(alpha=alpha).mean()
+            return pdf
+        
+        # Split and apply 
+        df= df.groupby(group_cols).apply(ema)
+    
+    return df
+
+alphas= [0.75, 0.95,1.0]    
+spark_df_v4=create_ewm_features(spark_df_v3, alphas, ["store","item"], "sales", "ewm")
+spark_df_v4.show()
+
+# COMMAND ----------
+
+# Comapring columns
+col_list=['sales_ewm_0_75','sales_ewm_0_95','sales_ewm_1_0']
+comapre_data(spark_df_v4,pandas_df_api_v4,['store', 'item','date'], col_list)
+
+# COMMAND ----------
+
+#####################################################
+#                                                   #
+# Data Leakge - Split trina and test data first     #
+#                                                   #
+#####################################################
+
+#  Seperate module - Featurization module
+#           Read data from Delta Lake - Parquet File
+#           Modify data using our code.. lagged, rolliong
+#           Write data back to Delta Lake - Parquet File
+# 
+#  Use PyTest to test functions (AWS Cloud 9)
+
+#
+# PandasUDF
+# Deepchecks 
+# Forecast helper house - Predicted 
+# Recursive for prediction - makes sense
+#
+######################################
+# Read that document shared by Pal
+######################################
 
 # Generating extra features such as week of year, day of week etc
 from pyspark.pandas.config import set_option, reset_option
@@ -254,22 +579,6 @@ final_data_df.head(10)
 # COMMAND ----------
 
 write_data_hive(final_data_df, "sale_train_final_data")
-
-# COMMAND ----------
-
-print("Total elements = %d"%final_data_df.shape[0])
-
-
-# COMMAND ----------
-
-
-print("Total elements = %d"%final_data_df.shape[0])
-final_data_df.dropna(inplace=True)
-print("Total elements after removing nulls = %d"%final_data_df.shape[0])
-
-# Convert pandas to pandas API
-pd_spark_df = ps.DataFrame(final_data_df)
-pd_spark_df.head()
 
 # COMMAND ----------
 
