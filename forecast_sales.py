@@ -923,6 +923,10 @@ def get_model_parameters(search_params):
 #    --> Trained Model
 #    --> Validation Mape Score
 def train_model(train_x,train_y,test_x,test_y,iterations, parameters_space):
+    # Extract column names of all features
+    feature_names = list()
+    for field in train_x.schema.fields:
+        feature_names.append(field.name)
     
     # Get parameters from models
     parameters = get_model_parameters(parameters_space)
@@ -937,7 +941,8 @@ def train_model(train_x,train_y,test_x,test_y,iterations, parameters_space):
                       iterations, 
                       valid_sets=[lgb_train, lgb_valid],
                       early_stopping_rounds=50, 
-                      verbose_eval=50
+                      verbose_eval=50,
+                      feature_name = feature_names
                      )
     
     # Return the best map score and the model
